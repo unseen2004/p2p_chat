@@ -1,0 +1,23 @@
+
+syntax  = "proto3"
+
+package chat;
+
+message ChatMessage {
+  string id = 1;
+  string sender_id = 2;
+  string recipient_id = 3;
+  string content = 4;
+  uint64 timestamp = 5;
+}
+
+message SyncRequest {
+  string my_peer_id = 1;
+}
+
+message Envelope {
+  oneof payload {
+    ChatMessage message = 1;
+    SyncRequest sync = 2;
+  }
+}

@@ -4,3 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[workspace]
+members = [
+    "core",    # Wspólne struktury, Protobuf, Serde
+    "network", # Logika P2P (libp2p, tokio)
+    "cli",     # Aplikacja terminalowa (clap)
+    "wasm",    # Kod do przeglądarki (WebAssembly)
+    "relay"    # Węzeł pośredniczący ze "skrzynką" do Dockera
+]
+resolver = "2"
