@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# libp2p z obsługą Tokio, TCP, szyfrowania (noise), multipleksowania (yamux) i protokołów
+libp2p = { version = "0.53", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "macros"] }
+tokio = { version = "1.36", features = ["full"] }
+futures = "0.3"
+common = { path = "../common" }
+anyhow = "1.0"

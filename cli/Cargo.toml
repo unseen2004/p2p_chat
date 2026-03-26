@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"] } # Nasz framework do CLI
+tokio = { version = "1.36", features = ["full"] } # Środowisko asynchroniczne
+anyhow = "1.0" # Prosta obsługa błędów
+common = { path = "../common" } # Podpinamy naszą paczkę core
+network = { path = "../network" } # Podpinamy paczkę network

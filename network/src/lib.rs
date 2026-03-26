@@ -1,14 +1,16 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+use anyhow::Result;
+use libp2p::{identity, PeerId};
+
+pub fn create_identity() -> Result<(identity::Keypair, PeerId)> {
+    let local_key = identity::Keypair::generate_ed25519();
+    let local_peer_id = PeerId::from(local_key.public());
+
+    Ok((local_key, local_peer_id))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub async fn start_node(port: u16, _relay_addr: Option<String>) -> Result<()> {
+    let (local_key, local_peer_id) = create_identity()?;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+    println!("Your PeerId is: {}", local_peer_id);
+    Ok(())
 }
