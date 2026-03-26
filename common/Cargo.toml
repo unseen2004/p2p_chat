@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-prost = "0.13" # Protobuf w Rust
-serde = { version = "1.0", features = ["derive"] } # Serializacja
-serde_json = "1.0" # Do odczytu/zapisu plików konfiguracyjnych
+prost = "0.13"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [build-dependencies]
-prost-build = "0.13" # Kompilator plików .proto
+prost-build = "0.13"

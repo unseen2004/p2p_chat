@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "common",    # Wspólne struktury, Protobuf, Serde
-    "network", # Logika P2P (libp2p, tokio)
-    "cli",     # Aplikacja terminalowa (clap)
-    "wasm",    # Kod do przeglądarki (WebAssembly)
-    "relay"    # Węzeł pośredniczący ze "skrzynką" do Dockera
+    "common",
+    "network",
+    "cli",
+    "wasm",
+    "relay"
 ]
 resolver = "2"

@@ -40,12 +40,10 @@ async fn main() -> Result<()> {
                 println!("Trying to connect to relay: {}", r);
             }
 
-            tokio::signal::ctrl_c().await?;
-            println!("Closing...");
+            network::start_node(*port, relay.clone()).await?;
         }
         Commands::Send { peer_id, message } => {
             println!("Sending message to {}: {}", peer_id, message);
-            //TODO: Sending
         }
     }
     Ok(())
