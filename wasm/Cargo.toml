@@ -11,12 +11,17 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["console"] }
-libp2p = { version = "0.53", default-features = false, features = ["wasm-ext", "web-socket-websys", "noise", "yamux", "gossipsub", "kad", "macros", "ed25519", "autonat"] }
+libp2p = { version = "0.53", default-features = false, features = ["wasm-bindgen", "websocket-websys", "noise", "yamux", "gossipsub", "kad", "macros", "ed25519", "autonat"] }
 common = { path = "../common" }
 prost = "0.13"
 uuid = { version = "1.8", features = ["v4", "js"] }
 futures = { version = "0.3", features = ["std"] }
-tokio = { version = "1.36", features = ["sync"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+
+# getrandom 0.2 is used by libp2p and others, needs "js" feature
 getrandom = { version = "0.2", features = ["js"] }
+
+# getrandom 0.3 and 0.4 need "wasm_js" feature and RUSTFLAGS
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }

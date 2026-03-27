@@ -40,7 +40,8 @@ To run the web version, you'll need `wasm-pack` and a simple HTTP server.
 1.  **Build the WASM package:**
     ```bash
     cd wasm
-    wasm-pack build --target web --out-dir ../frontend/pkg
+    # RUSTFLAGS are mandatory for getrandom 0.3/0.4 on WASM
+    RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --target web --out-dir ../frontend/pkg
     cd ..
     ```
 

@@ -6,7 +6,7 @@ use futures::select;
 use js_sys::Function;
 use libp2p::{
     gossipsub, identity, kad, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, yamux,
-    PeerId, SwarmBuilder, web_socket_websys,
+    PeerId, SwarmBuilder, websocket_websys, Transport,
 };
 use prost::Message;
 use std::collections::hash_map::DefaultHasher;
@@ -35,16 +35,16 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .message_id_fn(message_id_fn)
         .build()
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        .map_err(|e: gossipsub::ConfigBuilderError| JsValue::from_str(&format!("{e:?}")))?;
 
     let mut gossipsub = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Signed(local_key.clone()),
         gossipsub_config,
     )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    .map_err(|e: &str| JsValue::from_str(e))?;
 
     let topic = gossipsub::IdentTopic::new("global-chat");
-    gossipsub.subscribe(&topic).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    gossipsub.subscribe(&topic).map_err(|e: gossipsub::SubscriptionError| JsValue::from_str(&format!("{e:?}")))?;
 
     let store = kad::store::MemoryStore::new(local_peer_id);
     let kademlia = kad::Behaviour::new(local_peer_id, store);
@@ -57,18 +57,18 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
     let mut swarm = SwarmBuilder::with_existing_identity(local_key)
         .with_wasm_bindgen()
         .with_other_transport(|key| {
-            web_socket_websys::Transport::default()
+            websocket_websys::Transport::default()
                 .upgrade(libp2p::core::upgrade::Version::V1)
                 .authenticate(noise::Config::new(key).unwrap())
                 .multiplex(yamux::Config::default())
         })
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
+        .expect("infallible transport")
         .with_behaviour(|_| behaviour)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
+        .expect("infallible behaviour")
         .build();
 
-    let addr: libp2p::Multiaddr = relay_addr.parse().map_err(|e| JsValue::from_str(&e.to_string()))?;
-    swarm.dial(addr).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let addr: libp2p::Multiaddr = relay_addr.parse().map_err(|e: libp2p::multiaddr::Error| JsValue::from_str(&format!("{e:?}")))?;
+    swarm.dial(addr).map_err(|e: libp2p::swarm::DialError| JsValue::from_str(&format!("{e:?}")))?;
 
     let (tx, mut rx) = mpsc::unbounded::<String>();
     let _ = SENDER.set(tx);
@@ -112,7 +112,7 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
 #[wasm_bindgen]
 pub fn send_message(content: String) -> Result<(), JsValue> {
     if let Some(tx) = SENDER.get() {
-        tx.unbounded_send(content).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        tx.unbounded_send(content).map_err(|e: futures::channel::mpsc::TrySendError<String>| JsValue::from_str(&format!("{e:?}")))?;
         Ok(())
     } else {
         Err(JsValue::from_str("Node not started"))
