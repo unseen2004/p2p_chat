@@ -1,52 +1,29 @@
 import init, { start_chat, send_message } from './pkg/wasm.js';
 
-const relayAddr = '/dns4/relay.example.com/tcp/443/wss/p2p/QmRelayPeerId';
+const relayAddr = '/ip4/127.0.0.1/tcp/8001/ws';
 
 async function main() {
-    try {
-        await init();
-        
-        const messages = document.getElementById('messages');
-        const input = document.getElementById('input');
-        const sendBtn = document.getElementById('send');
+    await init();
+    const messages = document.getElementById('messages');
+    const input = document.getElementById('input');
+    
+    const onMessage = (sender, content) => {
+        const div = document.createElement('div');
+        div.className = 'msg';
+        div.innerHTML = `<span class="sender">${sender}</span>${content}`;
+        messages.appendChild(div);
+        messages.parentElement.scrollTop = messages.parentElement.scrollHeight;
+    };
 
-        const onMessage = (sender, content) => {
-            const div = document.createElement('div');
-            div.className = 'message';
-            const senderDiv = document.createElement('div');
-            senderDiv.className = 'sender';
-            senderDiv.textContent = sender;
-            const contentDiv = document.createElement('div');
-            contentDiv.className = 'content';
-            contentDiv.textContent = content;
-            div.appendChild(senderDiv);
-            div.appendChild(contentDiv);
-            messages.appendChild(div);
-            messages.parentElement.scrollTop = messages.parentElement.scrollHeight;
-        };
+    start_chat(relayAddr, onMessage).catch(console.error);
 
-        start_chat(relayAddr, onMessage).catch(err => console.error(err));
-
-        sendBtn.addEventListener('click', () => {
-            const content = input.value;
-            if (content) {
-                try {
-                    send_message(content);
-                    input.value = '';
-                } catch (e) {
-                    console.error(e);
-                }
-            }
-        });
-
-        input.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                sendBtn.click();
-            }
-        });
-    } catch (e) {
-        console.error(e);
-    }
+    document.getElementById('send').onclick = () => {
+        if (input.value) {
+            send_message(input.value);
+            input.value = '';
+        }
+    };
+    input.onkeypress = (e) => { if (e.key === 'Enter') document.getElementById('send').click(); };
 }
 
 main();
