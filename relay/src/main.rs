@@ -3,7 +3,7 @@ use common::pb::ChatMessage;
 use futures::StreamExt;
 use libp2p::{
     gossipsub, identity, kad, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux,
-    PeerId, SwarmBuilder, websocket,
+    PeerId, SwarmBuilder,
 };
 use prost::Message;
 use std::collections::hash_map::DefaultHasher;
@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     let mut gossipsub = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Signed(local_key.clone()),
         gossipsub_config,
-    )?;
+    ).map_err(|e| anyhow::anyhow!(e))?;
 
     let topic = gossipsub::IdentTopic::new("global-chat");
     gossipsub.subscribe(&topic)?;
@@ -81,7 +81,6 @@ async fn main() -> Result<()> {
             yamux::Config::default,
         )?
         .with_websocket(
-            websocket::Config::default(),
             noise::Config::new,
             yamux::Config::default,
         )
