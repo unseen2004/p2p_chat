@@ -13,16 +13,9 @@ enum Commands {
     Start {
         #[arg(short, long, default_value_t = 0)]
         port: u16,
+
         #[arg(short, long)]
         relay: Option<String>,
-    },
-
-    Send {
-        #[arg(short, long)]
-        peer_id: String,
-
-        #[arg(short, long)]
-        message: String,
     },
 }
 
@@ -32,19 +25,10 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Commands::Start { port, relay } => {
-            println!("Starting ...");
-            if *port != 0 {
-                println!("port : {}", port);
-            }
-            if let Some(r) = relay {
-                println!("Trying to connect to relay: {}", r);
-            }
-
+            println!("Starting Unseen Chat node...");
             network::start_node(*port, relay.clone()).await?;
         }
-        Commands::Send { peer_id, message } => {
-            println!("Sending message to {}: {}", peer_id, message);
-        }
     }
+
     Ok(())
 }
