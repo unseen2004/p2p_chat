@@ -10,14 +10,3 @@ message ChatMessage {
   string content = 4;
   uint64 timestamp = 5;
 }
-
-message SyncRequest {
-  string my_peer_id = 1;
-}
-
-message Envelope {
-  oneof payload {
-    ChatMessage message = 1;
-    SyncRequest sync = 2;
-  }
-}

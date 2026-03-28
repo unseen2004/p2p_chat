@@ -6,8 +6,6 @@ use libp2p::{
     PeerId, SwarmBuilder,
 };
 use prost::Message;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -28,13 +26,22 @@ pub async fn start_node(port: u16, relay_addr: Option<String>) -> Result<()> {
     println!("Local PeerId: {}", local_peer_id);
 
     let message_id_fn = |message: &gossipsub::Message| {
-        let mut s = DefaultHasher::new();
-        message.data.hash(&mut s);
-        gossipsub::MessageId::from(s.finish().to_string())
+        // Use the protobuf message UUID as gossipsub ID to avoid
+        // deduplication of different messages with identical content.
+        if let Ok(msg) = ChatMessage::decode(&message.data[..]) {
+            gossipsub::MessageId::from(msg.id)
+        } else {
+            // Fallback: use raw data hash
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut s = DefaultHasher::new();
+            message.data.hash(&mut s);
+            gossipsub::MessageId::from(s.finish().to_string())
+        }
     };
 
     let gossipsub_config = gossipsub::ConfigBuilder::default()
-        .heartbeat_interval(Duration::from_secs(10))
+        .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
         .message_id_fn(message_id_fn)
         .build()
@@ -105,6 +112,12 @@ pub async fn start_node(port: u16, relay_addr: Option<String>) -> Result<()> {
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     println!("Connected to: {}", peer_id);
                     swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
+                }
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    println!("Outgoing connection error to {:?}: {:?}", peer_id, error);
+                }
+                SwarmEvent::IncomingConnectionError { error, .. } => {
+                    println!("Incoming connection error: {:?}", error);
                 }
                 SwarmEvent::Behaviour(ChatBehaviorEvent::Gossipsub(gossipsub::Event::Message {
                     message,

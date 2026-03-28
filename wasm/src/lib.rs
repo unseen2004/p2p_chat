@@ -1,16 +1,14 @@
 use common::pb::ChatMessage;
 use futures::channel::mpsc;
-use futures::StreamExt;
 use futures::future::FutureExt;
 use futures::select;
+use futures::StreamExt;
 use js_sys::Function;
 use libp2p::{
-    gossipsub, identity, kad, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, yamux,
-    PeerId, SwarmBuilder, websocket_websys, Transport,
+    gossipsub, identity, kad, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, websocket_websys,
+    yamux, PeerId, Transport,
 };
 use prost::Message;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use wasm_bindgen::prelude::*;
 
 static SENDER: std::sync::OnceLock<mpsc::UnboundedSender<String>> = std::sync::OnceLock::new();
@@ -21,18 +19,36 @@ pub struct ChatBehavior {
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
 }
 
+/// Start the chat node and connect to the relay.
+///
+/// `on_message(local_peer_id, sender_id, content)` is called for every
+/// incoming gossipsub message so the JS side can filter out its own echoes.
 #[wasm_bindgen]
 pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), JsValue> {
+    // Guard against double-init: OnceLock only sets once.
+    if SENDER.get().is_some() {
+        return Err(JsValue::from_str(
+            "Chat node already started. Reload the page to reconnect.",
+        ));
+    }
+
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
-    
+
     let message_id_fn = |message: &gossipsub::Message| {
-        let mut s = DefaultHasher::new();
-        message.data.hash(&mut s);
-        gossipsub::MessageId::from(s.finish().to_string())
+        if let Ok(msg) = ChatMessage::decode(&message.data[..]) {
+            gossipsub::MessageId::from(msg.id)
+        } else {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut s = DefaultHasher::new();
+            message.data.hash(&mut s);
+            gossipsub::MessageId::from(s.finish().to_string())
+        }
     };
 
     let gossipsub_config = gossipsub::ConfigBuilder::default()
+        .heartbeat_interval(std::time::Duration::from_secs(1))
         .message_id_fn(message_id_fn)
         .build()
         .map_err(|e: gossipsub::ConfigBuilderError| JsValue::from_str(&format!("{e:?}")))?;
@@ -44,7 +60,9 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
     .map_err(|e: &str| JsValue::from_str(e))?;
 
     let topic = gossipsub::IdentTopic::new("global-chat");
-    gossipsub.subscribe(&topic).map_err(|e: gossipsub::SubscriptionError| JsValue::from_str(&format!("{e:?}")))?;
+    gossipsub
+        .subscribe(&topic)
+        .map_err(|e: gossipsub::SubscriptionError| JsValue::from_str(&format!("{e:?}")))?;
 
     let store = kad::store::MemoryStore::new(local_peer_id);
     let kademlia = kad::Behaviour::new(local_peer_id, store);
@@ -54,24 +72,34 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
         kademlia,
     };
 
-    let mut swarm = SwarmBuilder::with_existing_identity(local_key)
-        .with_wasm_bindgen()
-        .with_other_transport(|key| {
-            websocket_websys::Transport::default()
-                .upgrade(libp2p::core::upgrade::Version::V1)
-                .authenticate(noise::Config::new(key).unwrap())
-                .multiplex(yamux::Config::default())
-        })
-        .expect("infallible transport")
-        .with_behaviour(|_| behaviour)
-        .expect("infallible behaviour")
-        .build();
+    let transport = websocket_websys::Transport::default()
+        .upgrade(libp2p::core::upgrade::Version::V1)
+        .authenticate(
+            noise::Config::new(&local_key)
+                .map_err(|e| JsValue::from_str(&format!("{e:?}")))
+                .unwrap(),
+        )
+        .multiplex(yamux::Config::default())
+        .boxed();
 
-    let addr: libp2p::Multiaddr = relay_addr.parse().map_err(|e: libp2p::multiaddr::Error| JsValue::from_str(&format!("{e:?}")))?;
-    swarm.dial(addr).map_err(|e: libp2p::swarm::DialError| JsValue::from_str(&format!("{e:?}")))?;
+    let mut swarm = libp2p::Swarm::new(
+        transport,
+        behaviour,
+        local_peer_id,
+        libp2p::swarm::Config::with_wasm_executor(),
+    );
+
+    let addr: libp2p::Multiaddr = relay_addr
+        .parse()
+        .map_err(|e: libp2p::multiaddr::Error| JsValue::from_str(&format!("{e:?}")))?;
+    swarm
+        .dial(addr)
+        .map_err(|e: libp2p::swarm::DialError| JsValue::from_str(&format!("{e:?}")))?;
 
     let (tx, mut rx) = mpsc::unbounded::<String>();
     let _ = SENDER.set(tx);
+
+    let peer_id_str = local_peer_id.to_string();
 
     loop {
         select! {
@@ -79,7 +107,7 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
                 if let Some(content) = line {
                     let chat_msg = ChatMessage {
                         id: uuid::Uuid::new_v4().to_string(),
-                        sender_id: local_peer_id.to_string(),
+                        sender_id: peer_id_str.clone(),
                         recipient_id: "global".to_string(),
                         content,
                         timestamp: js_sys::Date::now() as u64 / 1000,
@@ -91,19 +119,15 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
                     }
                 }
             },
-            event = swarm.select_next_some() => match event {
-                SwarmEvent::Behaviour(ChatBehaviorEvent::Gossipsub(gossipsub::Event::Message {
-                    message,
-                    ..
-                })) => {
-                    if let Ok(msg) = ChatMessage::decode(&message.data[..]) {
-                        let this = JsValue::null();
-                        let content = JsValue::from_str(&msg.content);
-                        let sender = JsValue::from_str(&msg.sender_id);
-                        let _ = on_message.call2(&this, &sender, &content);
-                    }
-                }
-                _ => {}
+            event = swarm.select_next_some() => if let SwarmEvent::Behaviour(
+                ChatBehaviorEvent::Gossipsub(gossipsub::Event::Message { message, .. })
+            ) = event
+                && let Ok(msg) = ChatMessage::decode(&message.data[..]) {
+                    let this = JsValue::null();
+                    let peer = JsValue::from_str(&peer_id_str);
+                    let sender = JsValue::from_str(&msg.sender_id);
+                    let content = JsValue::from_str(&msg.content);
+                    let _ = on_message.call3(&this, &peer, &sender, &content);
             }
         }
     }
@@ -112,7 +136,10 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
 #[wasm_bindgen]
 pub fn send_message(content: String) -> Result<(), JsValue> {
     if let Some(tx) = SENDER.get() {
-        tx.unbounded_send(content).map_err(|e: futures::channel::mpsc::TrySendError<String>| JsValue::from_str(&format!("{e:?}")))?;
+        tx.unbounded_send(content)
+            .map_err(|e: futures::channel::mpsc::TrySendError<String>| {
+                JsValue::from_str(&format!("{e:?}"))
+            })?;
         Ok(())
     } else {
         Err(JsValue::from_str("Node not started"))
