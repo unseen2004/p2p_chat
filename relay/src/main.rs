@@ -1,17 +1,23 @@
 use anyhow::Result;
+use blake3::Hasher as Blake3Hasher;
 use common::pb::ChatMessage;
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, identity, kad, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux,
+    gossipsub, identity, kad, noise, request_response,
+    swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux,
     PeerId, SwarmBuilder,
 };
 use prost::Message;
 use std::collections::VecDeque;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tracing::{error, info};
 
 /// Maximum number of messages kept in the relay's history.
 const MAX_STORED_MESSAGES: usize = 500;
+/// Maximum allowed size in bytes for a single chat message content.
+const MAX_MESSAGE_BYTES: usize = 4096;
 
 #[derive(NetworkBehaviour)]
 pub struct RelayBehavior {
@@ -19,7 +25,7 @@ pub struct RelayBehavior {
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
 }
 
-fn load_messages(path: &str) -> VecDeque<ChatMessage> {
+fn load_messages(path: &Path) -> VecDeque<ChatMessage> {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return VecDeque::new(),
@@ -27,40 +33,62 @@ fn load_messages(path: &str) -> VecDeque<ChatMessage> {
     serde_json::from_str(&content).unwrap_or_default()
 }
 
-fn save_messages(path: &str, msgs: &VecDeque<ChatMessage>) {
+fn save_messages(path: &Path, msgs: &VecDeque<ChatMessage>) {
     match serde_json::to_string(msgs) {
         Ok(json) => {
             // Write to a temp file first, then rename for atomic replacement.
-            let tmp_path = format!("{}.tmp", path);
+            let tmp_path = path.with_extension("tmp");
             if let Err(e) = fs::write(&tmp_path, json.as_bytes()) {
-                eprintln!("Failed to write temp storage file: {e}");
+                error!("Failed to write temp storage file: {e}");
                 return;
             }
             if let Err(e) = fs::rename(&tmp_path, path) {
-                eprintln!("Failed to rename temp storage file: {e}");
+                error!("Failed to rename temp storage file: {e}");
             }
         }
-        Err(e) => eprintln!("Failed to serialize messages: {e}"),
+        Err(e) => error!("Failed to serialize messages: {e}"),
+    }
+}
+
+/// Load an Ed25519 keypair from `path`, creating and persisting it if absent.
+fn load_or_create_identity(path: &Path) -> Result<identity::Keypair> {
+    if path.exists() {
+        let bytes = fs::read(path)?;
+        Ok(identity::Keypair::from_protobuf_encoding(&bytes)?)
+    } else {
+        let kp = identity::Keypair::generate_ed25519();
+        let bytes = kp.to_protobuf_encoding()?;
+        fs::write(path, &bytes)?;
+        info!(path = %path.display(), "Generated and saved new relay identity");
+        Ok(kp)
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let storage_path = "storage.json";
+    tracing_subscriber::fmt::init();
 
-    let local_key = identity::Keypair::generate_ed25519();
+    // Allow overriding storage path via env var for flexibility.
+    let storage_path: PathBuf = std::env::var("STORAGE_PATH")
+        .unwrap_or_else(|_| "storage.json".to_string())
+        .into();
+
+    let identity_path: PathBuf = std::env::var("IDENTITY_PATH")
+        .unwrap_or_else(|_| "relay_identity.key".to_string())
+        .into();
+
+    let local_key = load_or_create_identity(&identity_path)?;
     let local_peer_id = PeerId::from(local_key.public());
-    println!("Relay PeerId: {}", local_peer_id);
+    info!(peer_id = %local_peer_id, "Relay identity loaded");
 
     let message_id_fn = |message: &gossipsub::Message| {
         if let Ok(msg) = ChatMessage::decode(&message.data[..]) {
             gossipsub::MessageId::from(msg.id)
         } else {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut s = DefaultHasher::new();
-            message.data.hash(&mut s);
-            gossipsub::MessageId::from(s.finish().to_string())
+            // Deterministic fallback using blake3 instead of DefaultHasher.
+            let mut h = Blake3Hasher::new();
+            h.update(&message.data);
+            gossipsub::MessageId::from(h.finalize().to_string())
         }
     };
 
@@ -69,7 +97,7 @@ async fn main() -> Result<()> {
         .validation_mode(gossipsub::ValidationMode::Strict)
         .message_id_fn(message_id_fn)
         .build()
-        .expect("Valid config");
+        .expect("Valid gossipsub config");
 
     let mut gossipsub = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Signed(local_key.clone()),
@@ -107,56 +135,57 @@ async fn main() -> Result<()> {
     swarm.listen_on("/ip4/0.0.0.0/tcp/8000".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/8001/ws".parse()?)?;
 
-    let mut stored_messages = load_messages(storage_path);
-    println!("Loaded {} messages from storage", stored_messages.len());
+    let mut stored_messages = load_messages(&storage_path);
+    info!(count = stored_messages.len(), "Loaded messages from storage");
 
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
-                println!("Relay listening on: {}", address);
+                info!(addr = %address, "Relay listening");
             }
             SwarmEvent::Behaviour(RelayBehaviorEvent::Gossipsub(gossipsub::Event::Message {
                 message,
                 ..
             })) => {
                 if let Ok(msg) = ChatMessage::decode(&message.data[..]) {
-                    println!("[{}]: {}", msg.sender_id, msg.content);
+                    // Drop oversized messages before storing.
+                    if msg.content.len() > MAX_MESSAGE_BYTES {
+                        error!(sender = %msg.sender_id, len = msg.content.len(), "Dropping oversized message");
+                        continue;
+                    }
+                    info!(sender = %msg.sender_id, "Message received");
 
-                    // Only store if we haven't seen this message ID before.
                     if !stored_messages.iter().any(|m| m.id == msg.id) {
                         stored_messages.push_back(msg);
-                        // Enforce bounded history.
                         while stored_messages.len() > MAX_STORED_MESSAGES {
                             stored_messages.pop_front();
                         }
-                        save_messages(storage_path, &stored_messages);
+                        save_messages(&storage_path, &stored_messages);
                     }
                 }
             }
+            // NOTE: History replay via gossipsub broadcast floods the entire mesh.
+            // A proper fix requires a request-response protocol so history is sent
+            // directly to the newly-subscribed peer only. This is tracked as a
+            // follow-up task. For now, history replay on subscription is removed
+            // to prevent mesh flooding.
             SwarmEvent::Behaviour(RelayBehaviorEvent::Gossipsub(
                 gossipsub::Event::Subscribed { peer_id, topic: t },
             )) => {
                 if t == topic.hash() {
-                    println!("Peer subscribed: {} — sending {} history messages", peer_id, stored_messages.len());
-                    for msg in &stored_messages {
-                        let mut buf = Vec::new();
-                        if msg.encode(&mut buf).is_ok() {
-                            let _ = swarm
-                                .behaviour_mut()
-                                .gossipsub
-                                .publish(topic.clone(), buf);
-                        }
-                    }
+                    info!(peer = %peer_id, count = stored_messages.len(),
+                          "Peer subscribed — history replay via gossipsub disabled to prevent mesh flood. \
+                           Implement request-response protocol for targeted delivery.");
                 }
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                println!("Peer connected: {}", peer_id);
+                info!(peer = %peer_id, "Peer connected");
             }
             SwarmEvent::IncomingConnectionError { error, .. } => {
-                eprintln!("Incoming connection error: {:?}", error);
+                error!(err = ?error, "Incoming connection error");
             }
             SwarmEvent::OutgoingConnectionError { error, .. } => {
-                eprintln!("Outgoing connection error: {:?}", error);
+                error!(err = ?error, "Outgoing connection error");
             }
             _ => {}
         }

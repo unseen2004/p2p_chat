@@ -11,6 +11,9 @@ use libp2p::{
 use prost::Message;
 use wasm_bindgen::prelude::*;
 
+/// Maximum allowed size in bytes for a single chat message content.
+const MAX_MESSAGE_BYTES: usize = 4096;
+
 static SENDER: std::sync::OnceLock<mpsc::UnboundedSender<String>> = std::sync::OnceLock::new();
 
 #[derive(NetworkBehaviour)]
@@ -25,12 +28,16 @@ pub struct ChatBehavior {
 /// incoming gossipsub message so the JS side can filter out its own echoes.
 #[wasm_bindgen]
 pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), JsValue> {
-    // Guard against double-init: OnceLock only sets once.
     if SENDER.get().is_some() {
         return Err(JsValue::from_str(
             "Chat node already started. Reload the page to reconnect.",
         ));
     }
+
+    // Validate relay address eagerly for a clear error.
+    let addr: libp2p::Multiaddr = relay_addr
+        .parse()
+        .map_err(|e: libp2p::multiaddr::Error| JsValue::from_str(&format!("Invalid relay address: {e:?}")))?;
 
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
@@ -39,11 +46,9 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
         if let Ok(msg) = ChatMessage::decode(&message.data[..]) {
             gossipsub::MessageId::from(msg.id)
         } else {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut s = DefaultHasher::new();
-            message.data.hash(&mut s);
-            gossipsub::MessageId::from(s.finish().to_string())
+            // Deterministic fallback using blake3 instead of DefaultHasher.
+            let hash = blake3::hash(&message.data);
+            gossipsub::MessageId::from(hash.to_string())
         }
     };
 
@@ -89,9 +94,6 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
         libp2p::swarm::Config::with_wasm_executor(),
     );
 
-    let addr: libp2p::Multiaddr = relay_addr
-        .parse()
-        .map_err(|e: libp2p::multiaddr::Error| JsValue::from_str(&format!("{e:?}")))?;
     swarm
         .dial(addr)
         .map_err(|e: libp2p::swarm::DialError| JsValue::from_str(&format!("{e:?}")))?;
@@ -105,6 +107,12 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
         select! {
             line = rx.next().fuse() => {
                 if let Some(content) = line {
+                    if content.len() > MAX_MESSAGE_BYTES {
+                        web_sys::console::warn_1(&JsValue::from_str(
+                            &format!("Message too large ({} bytes), dropping", content.len())
+                        ));
+                        continue;
+                    }
                     let chat_msg = ChatMessage {
                         id: uuid::Uuid::new_v4().to_string(),
                         sender_id: peer_id_str.clone(),
