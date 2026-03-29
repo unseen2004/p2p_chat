@@ -1,4 +1,12 @@
 use anyhow::Result;
+use axum::{
+    extract::State,
+    http::{header, HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
+    routing::get,
+    Router,
+};
+use base64::Engine;
 use blake3::Hasher as Blake3Hasher;
 use common::pb::ChatMessage;
 use futures::StreamExt;
@@ -11,14 +19,12 @@ use prost::Message;
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-/// Maximum number of messages kept in the relay's history.
 const MAX_STORED_MESSAGES: usize = 500;
-/// Maximum allowed size in bytes for a single encoded protobuf message.
 const MAX_MESSAGE_BYTES: usize = 4096;
-/// Persist storage after this many new messages (batched writes).
 const SAVE_BATCH_SIZE: usize = 10;
 
 #[derive(NetworkBehaviour)]
@@ -51,18 +57,12 @@ fn save_messages(path: &Path, msgs: &VecDeque<ChatMessage>) {
     }
 }
 
-/// Load an Ed25519 keypair from `path`, creating and persisting it if absent.
-/// Uses O_CREAT|O_EXCL (create_new) to avoid TOCTOU race between concurrent instances.
-/// Sets file permissions to 0o600 (owner read/write only).
 fn load_or_create_identity(path: &Path) -> Result<identity::Keypair> {
-    // Try atomic creation first.
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(_file) => {
-            // We won the race — generate and write.
             let kp = identity::Keypair::generate_ed25519();
             let bytes = kp.to_protobuf_encoding()?;
             fs::write(path, &bytes)?;
-            // Restrict permissions to owner-only on Unix.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -72,13 +72,112 @@ fn load_or_create_identity(path: &Path) -> Result<identity::Keypair> {
             Ok(kp)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // File already exists — load it.
             let bytes = fs::read(path)?;
             Ok(identity::Keypair::from_protobuf_encoding(&bytes)?)
         }
         Err(e) => Err(e.into()),
     }
 }
+
+// ── Shared state for the HTTP server ─────────────────────────────────────────
+
+#[derive(Clone)]
+struct AppState {
+    messages: Arc<RwLock<VecDeque<ChatMessage>>>,
+    password: String,
+}
+
+// ── HTTP handlers ─────────────────────────────────────────────────────────────
+
+fn check_auth(headers: &HeaderMap, password: &str) -> bool {
+    let Some(auth) = headers.get(header::AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(val) = auth.to_str() else { return false };
+    let Some(encoded) = val.strip_prefix("Basic ") else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Ok(creds) = std::str::from_utf8(&decoded) else {
+        return false;
+    };
+    // Accept "admin:<password>" or just ":<password>"
+    creds == format!("admin:{password}") || creds == format!(":{password}")
+}
+
+async fn inbox_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !check_auth(&headers, &state.password) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"Inbox\"")],
+            "Unauthorized",
+        )
+            .into_response();
+    }
+
+    let msgs = state.messages.read().unwrap();
+    let rows: String = if msgs.is_empty() {
+        "<tr><td colspan='3' style='color:#8b949e;text-align:center;padding:2rem'>No messages yet.</td></tr>".to_string()
+    } else {
+        msgs.iter()
+            .rev()
+            .map(|m| {
+                let sender = html_escape(&m.sender_id);
+                let content = html_escape(&m.content);
+                let ts = m.timestamp;
+                format!(
+                    "<tr><td class='ts'>{ts}</td><td class='sender'>{sender}</td><td class='body'>{content}</td></tr>"
+                )
+            })
+            .collect()
+    };
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Inbox</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:2rem}}
+h1{{font-size:1.1rem;margin-bottom:1.2rem;color:#e6edf3}}
+table{{width:100%;border-collapse:collapse;max-width:900px}}
+th{{text-align:left;font-size:0.72rem;color:#8b949e;padding:0.4rem 0.6rem;border-bottom:1px solid rgba(255,255,255,0.08)}}
+td{{padding:0.55rem 0.6rem;border-bottom:1px solid rgba(255,255,255,0.05);font-size:0.85rem;vertical-align:top}}
+td.ts{{color:#8b949e;font-size:0.7rem;white-space:nowrap;width:80px}}
+td.sender{{color:#79c0ff;font-size:0.7rem;word-break:break-all;width:220px}}
+td.body{{color:#e6edf3;white-space:pre-wrap;word-break:break-word}}
+tr:hover td{{background:rgba(255,255,255,0.03)}}
+</style>
+</head>
+<body>
+<h1>&#128274; Inbox &mdash; {count} message(s)</h1>
+<table>
+<thead><tr><th>Time</th><th>From (Peer ID)</th><th>Message</th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</body>
+</html>
+"#,
+        count = msgs.len(),
+        rows = rows
+    );
+
+    Html(html).into_response()
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -98,6 +197,12 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8001);
+    let http_port: u16 = std::env::var("INBOX_HTTP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8080);
+    let inbox_password = std::env::var("INBOX_PASSWORD")
+        .unwrap_or_else(|_| "changeme".to_string());
 
     let local_key = load_or_create_identity(&identity_path)?;
     let local_peer_id = PeerId::from(local_key.public());
@@ -120,19 +225,22 @@ async fn main() -> Result<()> {
         .build()
         .expect("Valid gossipsub config");
 
-    let mut gossipsub = gossipsub::Behaviour::new(
+    let mut gossipsub_behaviour = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Signed(local_key.clone()),
         gossipsub_config,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
     let topic = gossipsub::IdentTopic::new("global-chat");
-    gossipsub.subscribe(&topic)?;
+    gossipsub_behaviour.subscribe(&topic)?;
 
     let store = kad::store::MemoryStore::new(local_peer_id);
     let kademlia = kad::Behaviour::new(local_peer_id, store);
 
-    let behaviour = RelayBehavior { gossipsub, kademlia };
+    let behaviour = RelayBehavior {
+        gossipsub: gossipsub_behaviour,
+        kademlia,
+    };
 
     let mut swarm = SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
@@ -146,10 +254,25 @@ async fn main() -> Result<()> {
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{tcp_port}").parse()?)?;
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{ws_port}/ws").parse()?)?;
 
-    let mut stored_messages = load_messages(&storage_path);
-    info!(count = stored_messages.len(), "Loaded messages from storage");
+    let stored_messages = Arc::new(RwLock::new(load_messages(&storage_path)));
+    info!(count = stored_messages.read().unwrap().len(), "Loaded messages from storage");
 
-    // Counter for batched saves.
+    // ── Spawn HTTP inbox server ───────────────────────────────────────────────
+    let app_state = AppState {
+        messages: Arc::clone(&stored_messages),
+        password: inbox_password,
+    };
+    let app = Router::new()
+        .route("/inbox", get(inbox_handler))
+        .with_state(app_state);
+    let http_addr: std::net::SocketAddr = format!("0.0.0.0:{http_port}").parse()?;
+    info!(addr = %http_addr, "HTTP inbox server listening");
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // ── P2P event loop ────────────────────────────────────────────────────────
     let mut unsaved: usize = 0;
 
     loop {
@@ -160,21 +283,21 @@ async fn main() -> Result<()> {
             SwarmEvent::Behaviour(RelayBehaviorEvent::Gossipsub(gossipsub::Event::Message {
                 message, ..
             })) => {
-                // Enforce encoded payload size limit.
                 if message.data.len() > MAX_MESSAGE_BYTES {
                     warn!(len = message.data.len(), "Dropping oversized raw message");
                     continue;
                 }
                 if let Ok(msg) = ChatMessage::decode(&message.data[..]) {
                     info!(sender = %msg.sender_id, "Message received");
-                    if !stored_messages.iter().any(|m| m.id == msg.id) {
-                        stored_messages.push_back(msg);
-                        while stored_messages.len() > MAX_STORED_MESSAGES {
-                            stored_messages.pop_front();
+                    let mut msgs = stored_messages.write().unwrap();
+                    if !msgs.iter().any(|m| m.id == msg.id) {
+                        msgs.push_back(msg);
+                        while msgs.len() > MAX_STORED_MESSAGES {
+                            msgs.pop_front();
                         }
                         unsaved += 1;
                         if unsaved >= SAVE_BATCH_SIZE {
-                            save_messages(&storage_path, &stored_messages);
+                            save_messages(&storage_path, &msgs);
                             unsaved = 0;
                         }
                     }
@@ -186,8 +309,7 @@ async fn main() -> Result<()> {
                 if t == topic.hash() {
                     info!(
                         peer = %peer_id,
-                        count = stored_messages.len(),
-                        "Peer subscribed — history replay disabled (implement request-response for targeted delivery)"
+                        "Peer subscribed"
                     );
                 }
             }
