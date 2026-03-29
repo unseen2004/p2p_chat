@@ -11,3 +11,5 @@ anyhow = "1.0"
 common = { path = "../common" }
 prost = "0.13"
 uuid = { version = "1.8", features = ["v4"] }
+blake3 = "1"
+tracing = "0.1"

@@ -17,6 +17,7 @@ prost = "0.13"
 uuid = { version = "1.8", features = ["v4", "js"] }
 futures = { version = "0.3", features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
+blake3 = { version = "1", default-features = false, features = ["no_avx512"] }
 
 # getrandom 0.2 is used by libp2p and others, needs "js" feature
 getrandom = { version = "0.2", features = ["js"] }
