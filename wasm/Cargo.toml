@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["console"] }
+web-sys = { version = "0.3", features = ["console", "Window", "Storage"] }
 libp2p = { version = "0.53", default-features = false, features = ["wasm-bindgen", "websocket-websys", "noise", "yamux", "gossipsub", "kad", "macros", "ed25519", "autonat"] }
 common = { path = "../common" }
 prost = "0.13"

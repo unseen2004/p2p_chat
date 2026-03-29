@@ -11,7 +11,7 @@ use libp2p::{
 use prost::Message;
 use wasm_bindgen::prelude::*;
 
-/// Maximum allowed size in bytes for a single chat message content.
+/// Maximum allowed size in bytes for the encoded protobuf payload.
 const MAX_MESSAGE_BYTES: usize = 4096;
 
 static SENDER: std::sync::OnceLock<mpsc::UnboundedSender<String>> = std::sync::OnceLock::new();
@@ -42,11 +42,47 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
 
+    // Persist identity in localStorage so peer ID survives page reloads.
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
+    let storage = window
+        .local_storage()
+        .map_err(|e| JsValue::from_str(&format!("localStorage error: {e:?}")))?;
+
+    let local_key = if let Some(storage) = storage {
+        const STORAGE_KEY: &str = "p2p_chat_identity";
+        if let Ok(Some(encoded)) = storage.get_item(STORAGE_KEY) {
+            // Try to load existing key from localStorage.
+            match base64_decode(&encoded)
+                .ok()
+                .and_then(|b| identity::Keypair::from_protobuf_encoding(&b).ok())
+            {
+                Some(kp) => kp,
+                None => {
+                    // Corrupted — regenerate.
+                    let kp = identity::Keypair::generate_ed25519();
+                    if let Ok(bytes) = kp.to_protobuf_encoding() {
+                        let _ = storage.set_item(STORAGE_KEY, &base64_encode(&bytes));
+                    }
+                    kp
+                }
+            }
+        } else {
+            // First run — persist the freshly generated key.
+            if let Ok(bytes) = local_key.to_protobuf_encoding() {
+                let _ = storage.set_item(STORAGE_KEY, &base64_encode(&bytes));
+            }
+            local_key
+        }
+    } else {
+        local_key
+    };
+
+    let local_peer_id = PeerId::from(local_key.public());
+
     let message_id_fn = |message: &gossipsub::Message| {
         if let Ok(msg) = ChatMessage::decode(&message.data[..]) {
             gossipsub::MessageId::from(msg.id)
         } else {
-            // Deterministic fallback using blake3 instead of DefaultHasher.
             let hash = blake3::hash(&message.data);
             gossipsub::MessageId::from(hash.to_string())
         }
@@ -72,17 +108,13 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
     let store = kad::store::MemoryStore::new(local_peer_id);
     let kademlia = kad::Behaviour::new(local_peer_id, store);
 
-    let behaviour = ChatBehavior {
-        gossipsub,
-        kademlia,
-    };
+    let behaviour = ChatBehavior { gossipsub, kademlia };
 
     let transport = websocket_websys::Transport::default()
         .upgrade(libp2p::core::upgrade::Version::V1)
         .authenticate(
             noise::Config::new(&local_key)
-                .map_err(|e| JsValue::from_str(&format!("{e:?}")))
-                .unwrap(),
+                .map_err(|e| JsValue::from_str(&format!("Noise config error: {e:?}")))?,
         )
         .multiplex(yamux::Config::default())
         .boxed();
@@ -107,12 +139,6 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
         select! {
             line = rx.next().fuse() => {
                 if let Some(content) = line {
-                    if content.len() > MAX_MESSAGE_BYTES {
-                        web_sys::console::warn_1(&JsValue::from_str(
-                            &format!("Message too large ({} bytes), dropping", content.len())
-                        ));
-                        continue;
-                    }
                     let chat_msg = ChatMessage {
                         id: uuid::Uuid::new_v4().to_string(),
                         sender_id: peer_id_str.clone(),
@@ -123,6 +149,13 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
 
                     let mut buf = Vec::new();
                     if chat_msg.encode(&mut buf).is_ok() {
+                        // Enforce size limit on the actual encoded payload.
+                        if buf.len() > MAX_MESSAGE_BYTES {
+                            web_sys::console::warn_1(&JsValue::from_str(
+                                &format!("Encoded message too large ({} bytes), dropping", buf.len())
+                            ));
+                            continue;
+                        }
                         let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), buf);
                     }
                 }
@@ -139,6 +172,22 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
             }
         }
     }
+}
+
+/// Minimal base64 encode/decode using the js-sys btoa/atob APIs.
+fn base64_encode(data: &[u8]) -> String {
+    let chars: Vec<u16> = data.iter().map(|&b| b as u16).collect();
+    let js_str = js_sys::String::from_char_code(&chars);
+    js_sys::eval(&format!("btoa('{}')", js_str.as_string().unwrap_or_default()))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default()
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
+    let result = js_sys::eval(&format!("atob('{s}')")).map_err(|_| ())?;
+    let js_str = result.as_string().ok_or(())?;
+    Ok(js_str.encode_utf16().map(|c| c as u8).collect())
 }
 
 #[wasm_bindgen]
