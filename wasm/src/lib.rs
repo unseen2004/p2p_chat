@@ -4,6 +4,7 @@ use futures::future::FutureExt;
 use futures::select;
 use futures::StreamExt;
 use js_sys::Function;
+use js_sys::JsString;
 use libp2p::{
     gossipsub, identity, kad, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, websocket_websys,
     yamux, PeerId, Transport,
@@ -149,7 +150,6 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
 
                     let mut buf = Vec::new();
                     if chat_msg.encode(&mut buf).is_ok() {
-                        // Enforce size limit on the actual encoded payload.
                         if buf.len() > MAX_MESSAGE_BYTES {
                             web_sys::console::warn_1(&JsValue::from_str(
                                 &format!("Encoded message too large ({} bytes), dropping", buf.len())
@@ -177,7 +177,7 @@ pub async fn start_chat(relay_addr: String, on_message: Function) -> Result<(), 
 /// Minimal base64 encode/decode using the js-sys btoa/atob APIs.
 fn base64_encode(data: &[u8]) -> String {
     let chars: Vec<u16> = data.iter().map(|&b| b as u16).collect();
-    let js_str = js_sys::String::from_char_code(&chars);
+    let js_str = JsString::from_char_code(&chars);
     js_sys::eval(&format!("btoa('{}')", js_str.as_string().unwrap_or_default()))
         .ok()
         .and_then(|v| v.as_string())
