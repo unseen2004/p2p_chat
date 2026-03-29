@@ -7,12 +7,13 @@ use libp2p::{
     PeerId, SwarmBuilder,
 };
 use prost::Message;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{error, info, warn};
 
-/// Maximum allowed size in bytes for a single chat message content.
+/// Maximum allowed size in bytes for the encoded protobuf payload.
 const MAX_MESSAGE_BYTES: usize = 4096;
 
 #[derive(NetworkBehaviour)]
@@ -22,20 +23,30 @@ pub struct ChatBehavior {
 }
 
 /// Load an Ed25519 keypair from `path`, creating and persisting it if absent.
+/// Uses O_CREAT|O_EXCL to avoid TOCTOU race. Sets file permissions to 0o600.
 pub fn load_or_create_identity(path: &Path) -> Result<(identity::Keypair, PeerId)> {
-    let local_key = if path.exists() {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading keypair from {}", path.display()))?;
-        identity::Keypair::from_protobuf_encoding(&bytes)
-            .context("decoding keypair from file")?  
-    } else {
-        let kp = identity::Keypair::generate_ed25519();
-        let bytes = kp.to_protobuf_encoding()
-            .context("encoding keypair")?;
-        std::fs::write(path, &bytes)
-            .with_context(|| format!("writing keypair to {}", path.display()))?;
-        info!(path = %path.display(), "Generated and saved new identity");
-        kp
+    let local_key = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(_file) => {
+            let kp = identity::Keypair::generate_ed25519();
+            let bytes = kp.to_protobuf_encoding().context("encoding keypair")?;
+            fs::write(path, &bytes)
+                .with_context(|| format!("writing keypair to {}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("setting permissions on {}", path.display()))?;
+            }
+            info!(path = %path.display(), "Generated and saved new identity");
+            kp
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let bytes = fs::read(path)
+                .with_context(|| format!("reading keypair from {}", path.display()))?;
+            identity::Keypair::from_protobuf_encoding(&bytes)
+                .context("decoding keypair from file")?
+        }
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
     };
     let peer_id = PeerId::from(local_key.public());
     Ok((local_key, peer_id))
@@ -56,7 +67,6 @@ pub async fn start_node(port: u16, relay_addr: Option<String>) -> Result<()> {
         if let Ok(msg) = ChatMessage::decode(&message.data[..]) {
             gossipsub::MessageId::from(msg.id)
         } else {
-            // Deterministic fallback using blake3 instead of DefaultHasher.
             let mut h = Blake3Hasher::new();
             h.update(&message.data);
             gossipsub::MessageId::from(h.finalize().to_string())
@@ -82,7 +92,6 @@ pub async fn start_node(port: u16, relay_addr: Option<String>) -> Result<()> {
     let store = kad::store::MemoryStore::new(local_peer_id);
     let mut kademlia = kad::Behaviour::new(local_peer_id, store);
 
-    // Pre-add relay to Kademlia routing table so bootstrap has an entry point.
     if let Some(ref addr) = relay_multiaddr {
         if let Some(peer_id) = addr.iter().find_map(|p| {
             if let libp2p::multiaddr::Protocol::P2p(id) = p {
@@ -97,18 +106,11 @@ pub async fn start_node(port: u16, relay_addr: Option<String>) -> Result<()> {
         }
     }
 
-    let behaviour = ChatBehavior {
-        gossipsub,
-        kademlia,
-    };
+    let behaviour = ChatBehavior { gossipsub, kademlia };
 
     let mut swarm = SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
+        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
         .with_behaviour(|_| behaviour)?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
@@ -126,10 +128,6 @@ pub async fn start_node(port: u16, relay_addr: Option<String>) -> Result<()> {
     loop {
         tokio::select! {
             Ok(Some(line)) = stdin.next_line() => {
-                if line.len() > MAX_MESSAGE_BYTES {
-                    warn!(len = line.len(), max = MAX_MESSAGE_BYTES, "Message too large, dropping");
-                    continue;
-                }
                 let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 let chat_msg = ChatMessage {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -141,6 +139,12 @@ pub async fn start_node(port: u16, relay_addr: Option<String>) -> Result<()> {
 
                 let mut buf = Vec::new();
                 chat_msg.encode(&mut buf)?;
+
+                // Enforce size limit on the actual encoded payload.
+                if buf.len() > MAX_MESSAGE_BYTES {
+                    warn!(len = buf.len(), max = MAX_MESSAGE_BYTES, "Encoded message too large, dropping");
+                    continue;
+                }
 
                 if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), buf) {
                     error!(err = ?e, "Publish error");
@@ -161,8 +165,7 @@ pub async fn start_node(port: u16, relay_addr: Option<String>) -> Result<()> {
                     error!(err = ?error, "Incoming connection error");
                 }
                 SwarmEvent::Behaviour(ChatBehaviorEvent::Gossipsub(gossipsub::Event::Message {
-                    message,
-                    ..
+                    message, ..
                 })) => {
                     if let Ok(msg) = ChatMessage::decode(&message.data[..]) {
                         info!(sender = %msg.sender_id, content = %msg.content);
