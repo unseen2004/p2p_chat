@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 const MAX_STORED_MESSAGES: usize = 500;
@@ -80,21 +80,16 @@ fn load_or_create_identity(path: &Path) -> Result<identity::Keypair> {
 }
 
 /// Format a unix timestamp (seconds) as "YYYY-MM-DD HH:MM:SS UTC".
-/// Falls back to the raw number if the value is out of range.
-fn fmt_timestamp(ts: i64) -> String {
-    if ts <= 0 {
+fn fmt_timestamp(ts: u64) -> String {
+    if ts == 0 {
         return "—".to_string();
     }
-    let secs = ts as u64;
-    // Manual UTC breakdown — no external crate needed.
-    // seconds since epoch → days
-    let mut days = secs / 86400;
-    let time_of_day = secs % 86400;
+    let mut days = ts / 86400;
+    let time_of_day = ts % 86400;
     let hh = time_of_day / 3600;
     let mm = (time_of_day % 3600) / 60;
     let ss = time_of_day % 60;
 
-    // Gregorian calendar
     let mut year = 1970u32;
     loop {
         let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
