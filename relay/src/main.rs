@@ -20,12 +20,12 @@ use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 const MAX_STORED_MESSAGES: usize = 500;
 const MAX_MESSAGE_BYTES: usize = 4096;
-const SAVE_BATCH_SIZE: usize = 1; // save every message immediately
+const SAVE_BATCH_SIZE: usize = 1;
 
 #[derive(NetworkBehaviour)]
 pub struct RelayBehavior {
@@ -79,7 +79,45 @@ fn load_or_create_identity(path: &Path) -> Result<identity::Keypair> {
     }
 }
 
-// ── Shared state ───────────────────────────────────────────────────────────────────
+/// Format a unix timestamp (seconds) as "YYYY-MM-DD HH:MM:SS UTC".
+/// Falls back to the raw number if the value is out of range.
+fn fmt_timestamp(ts: i64) -> String {
+    if ts <= 0 {
+        return "—".to_string();
+    }
+    let secs = ts as u64;
+    // Manual UTC breakdown — no external crate needed.
+    // seconds since epoch → days
+    let mut days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hh = time_of_day / 3600;
+    let mm = (time_of_day % 3600) / 60;
+    let ss = time_of_day % 60;
+
+    // Gregorian calendar
+    let mut year = 1970u32;
+    loop {
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days_in_year = if leap { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = [31u64, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1u32;
+    for &md in &month_days {
+        if days < md { break; }
+        days -= md;
+        month += 1;
+    }
+    let day = days + 1;
+    format!("{year}-{month:02}-{day:02} {hh:02}:{mm:02}:{ss:02} UTC")
+}
+
+// ── Shared state ────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct AppState {
@@ -87,7 +125,7 @@ struct AppState {
     password: String,
 }
 
-// ── HTTP handlers ───────────────────────────────────────────────────────────
+// ── HTTP handlers ─────────────────────────────────────────────────────────
 
 fn check_auth(headers: &HeaderMap, password: &str) -> bool {
     let Some(auth) = headers.get(header::AUTHORIZATION) else {
@@ -123,9 +161,9 @@ async fn inbox_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
         msgs.iter()
             .rev()
             .map(|m| {
-                let sender = html_escape(&m.sender_id);
+                let sender  = html_escape(&m.sender_id);
                 let content = html_escape(&m.content);
-                let ts = m.timestamp;
+                let ts      = fmt_timestamp(m.timestamp);
                 format!(
                     "<tr><td class='ts'>{ts}</td><td class='sender'>{sender}</td><td class='body'>{content}</td></tr>"
                 )
@@ -139,15 +177,17 @@ async fn inbox_handler(State(state): State<AppState>, headers: HeaderMap) -> Res
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="30">
 <title>Inbox</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{background:#0d1117;color:#c9d1d9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:2rem}}
-h1{{font-size:1.1rem;margin-bottom:1.2rem;color:#e6edf3}}
+h1{{font-size:1.1rem;margin-bottom:0.4rem;color:#e6edf3}}
+.subtitle{{font-size:0.72rem;color:#8b949e;margin-bottom:1.2rem}}
 table{{width:100%;border-collapse:collapse;max-width:900px}}
 th{{text-align:left;font-size:0.72rem;color:#8b949e;padding:0.4rem 0.6rem;border-bottom:1px solid rgba(255,255,255,0.08)}}
 td{{padding:0.55rem 0.6rem;border-bottom:1px solid rgba(255,255,255,0.05);font-size:0.85rem;vertical-align:top}}
-td.ts{{color:#8b949e;font-size:0.7rem;white-space:nowrap;width:80px}}
+td.ts{{color:#8b949e;font-size:0.7rem;white-space:nowrap;width:160px}}
 td.sender{{color:#79c0ff;font-size:0.7rem;word-break:break-all;width:220px}}
 td.body{{color:#e6edf3;white-space:pre-wrap;word-break:break-word}}
 tr:hover td{{background:rgba(255,255,255,0.03)}}
@@ -155,15 +195,16 @@ tr:hover td{{background:rgba(255,255,255,0.03)}}
 </head>
 <body>
 <h1>&#128274; Inbox &mdash; {count} message(s)</h1>
+<div class="subtitle">Auto-refreshes every 30s</div>
 <table>
-<thead><tr><th>Time</th><th>From (Peer ID)</th><th>Message</th></tr></thead>
+<thead><tr><th>Time (UTC)</th><th>From (Peer ID)</th><th>Message</th></tr></thead>
 <tbody>{rows}</tbody>
 </table>
 </body>
 </html>
 "#,
         count = msgs.len(),
-        rows = rows
+        rows  = rows
     );
 
     Html(html).into_response()
@@ -176,7 +217,7 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -217,7 +258,6 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Lower mesh thresholds so relay receives messages even with 1 peer
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
@@ -261,7 +301,6 @@ async fn main() -> Result<()> {
     let stored_messages = Arc::new(RwLock::new(load_messages(&storage_path)));
     info!(count = stored_messages.read().unwrap().len(), "Loaded messages from storage");
 
-    // ── Spawn HTTP inbox server ───────────────────────────────────────────────
     let app_state = AppState {
         messages: Arc::clone(&stored_messages),
         password: inbox_password,
@@ -276,7 +315,6 @@ async fn main() -> Result<()> {
         axum::serve(listener, app).await.unwrap();
     });
 
-    // ── P2P event loop ────────────────────────────────────────────────────────
     let mut unsaved: usize = 0;
 
     loop {
