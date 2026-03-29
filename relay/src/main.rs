@@ -25,7 +25,7 @@ use tracing::{error, info, warn};
 
 const MAX_STORED_MESSAGES: usize = 500;
 const MAX_MESSAGE_BYTES: usize = 4096;
-const SAVE_BATCH_SIZE: usize = 10;
+const SAVE_BATCH_SIZE: usize = 1; // save every message immediately
 
 #[derive(NetworkBehaviour)]
 pub struct RelayBehavior {
@@ -79,7 +79,7 @@ fn load_or_create_identity(path: &Path) -> Result<identity::Keypair> {
     }
 }
 
-// ── Shared state for the HTTP server ─────────────────────────────────────────
+// ── Shared state ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct AppState {
@@ -87,7 +87,7 @@ struct AppState {
     password: String,
 }
 
-// ── HTTP handlers ─────────────────────────────────────────────────────────────
+// ── HTTP handlers ───────────────────────────────────────────────────────────
 
 fn check_auth(headers: &HeaderMap, password: &str) -> bool {
     let Some(auth) = headers.get(header::AUTHORIZATION) else {
@@ -103,7 +103,6 @@ fn check_auth(headers: &HeaderMap, password: &str) -> bool {
     let Ok(creds) = std::str::from_utf8(&decoded) else {
         return false;
     };
-    // Accept "admin:<password>" or just ":<password>"
     creds == format!("admin:{password}") || creds == format!(":{password}")
 }
 
@@ -177,7 +176,7 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -218,10 +217,15 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Lower mesh thresholds so relay receives messages even with 1 peer
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
         .message_id_fn(message_id_fn)
+        .mesh_n_low(1)
+        .mesh_n(2)
+        .mesh_n_high(4)
+        .mesh_outbound_min(0)
         .build()
         .expect("Valid gossipsub config");
 
@@ -288,7 +292,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 if let Ok(msg) = ChatMessage::decode(&message.data[..]) {
-                    info!(sender = %msg.sender_id, "Message received");
+                    info!(sender = %msg.sender_id, content = %msg.content, "Message received");
                     let mut msgs = stored_messages.write().unwrap();
                     if !msgs.iter().any(|m| m.id == msg.id) {
                         msgs.push_back(msg);
@@ -307,10 +311,7 @@ async fn main() -> Result<()> {
                 gossipsub::Event::Subscribed { peer_id, topic: t },
             )) => {
                 if t == topic.hash() {
-                    info!(
-                        peer = %peer_id,
-                        "Peer subscribed"
-                    );
+                    info!(peer = %peer_id, "Peer subscribed");
                 }
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
