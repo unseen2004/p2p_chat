@@ -1,4 +1,4 @@
-useage : https://unseen2004.github.io/
+usage : https://unseen2004.github.io/
 
 # P2P Chat
 
